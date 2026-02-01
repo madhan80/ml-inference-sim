@@ -1,8 +1,9 @@
 import heapq
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional, Deque
+from typing import List, Optional, Deque, Dict
 from collections import deque
+import numpy as np
 
 @dataclass
 class Request:
@@ -10,8 +11,10 @@ class Request:
     arrival_time: float
     input_tokens: int
     output_tokens: int
+    deadline: Optional[float] = None # Absolute time by which it must finish
     start_time: float = -1.0
     completion_time: float = -1.0
+    status: str = "PENDING" # PENDING, RUNNING, COMPLETED, FLUSHED (dropped)
 
     @property
     def latency(self):
@@ -89,6 +92,9 @@ class Simulator:
     def handle_arrival(self, request_id: int):
         req = self.requests_map[request_id]
         
+        # Check deadline before queuing (if tight)
+        # Note: strict systems drop at ingress, but usually we drop at schedule time
+        
         # Try to schedule immediately
         device = self.cluster.get_next_device()
         if device:
@@ -101,20 +107,35 @@ class Simulator:
         device = self.cluster.devices[device_id]
         
         req.completion_time = self.current_time
+        req.status = "COMPLETED"
         self.completed_requests.append(req)
         
         device.is_busy = False
         device.current_request = None
         
         # Check queue
-        if self.waiting_queue:
+        while self.waiting_queue:
             next_req = self.waiting_queue.popleft()
+            
+            # DEADLINE CHECK: If request has waited too long, drop it
+            # Estimated service time needed
+            est_duration = device.calculate_duration(next_req)
+            if next_req.deadline is not None and (self.current_time + est_duration > next_req.deadline):
+                # Drop request
+                next_req.status = "DROPPED"
+                next_req.completion_time = -1 
+                # We count dropped requests but don't process them
+                self.completed_requests.append(next_req)
+                continue # Loop to next in queue
+                
             self._start_job(device, next_req)
+            break
 
     def _start_job(self, device: Device, req: Request):
         device.is_busy = True
         device.current_request = req
         req.start_time = self.current_time
+        req.status = "RUNNING"
         
         duration = device.calculate_duration(req)
         device.total_busy_time += duration
@@ -123,18 +144,42 @@ class Simulator:
         self.schedule_event(completion_time, "DEVICE_FREE", req.id, device.id)
 
     def get_stats(self):
-        if not self.completed_requests:
-            return "No requests completed."
+        completed = [r for r in self.completed_requests if r.status == "COMPLETED"]
+        dropped = [r for r in self.completed_requests if r.status == "DROPPED"]
         
-        latencies = [r.latency for r in self.completed_requests]
+        total_count = len(self.requests_map)
+        processed_count = len(completed)
+        drop_count = len(dropped)
+        
+        if not completed:
+            return {
+                "total_requests": total_count,
+                "processed": 0,
+                "dropped": drop_count,
+                "throughput_rpm": 0,
+                "avg_latency_sec": 0,
+                "p50_latency_sec": 0,
+                "p90_latency_sec": 0,
+                "p99_latency_sec": 0
+            }
+        
+        latencies = sorted([r.latency for r in completed])
         avg_lat = sum(latencies) / len(latencies)
-        max_lat = max(latencies)
-        throughput = len(self.completed_requests) / (self.current_time if self.current_time > 0 else 1) * 60 # RPM
+        p50 = np.percentile(latencies, 50)
+        p90 = np.percentile(latencies, 90)
+        p99 = np.percentile(latencies, 99)
+        
+        throughput = processed_count / (self.current_time if self.current_time > 0 else 1) * 60 # RPM
         
         return {
-            "total_requests": len(self.completed_requests),
+            "total_requests": total_count,
+            "processed": processed_count,
+            "dropped": drop_count,
             "avg_latency_sec": avg_lat,
-            "max_latency_sec": max_lat,
+            "max_latency_sec": latencies[-1],
+            "p50_latency_sec": p50,
+            "p90_latency_sec": p90,
+            "p99_latency_sec": p99,
             "throughput_rpm": throughput,
             "total_time_sec": self.current_time
         }
